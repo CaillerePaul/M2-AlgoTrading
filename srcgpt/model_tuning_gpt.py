@@ -65,9 +65,25 @@ def sample_params(trial: optuna.Trial, param_space: Dict[str, tuple]) -> Dict[st
 
 class ModelTuningValidation:
     """
-    - Fait une validation croisée temporelle (TimeSeriesSplit)
-    - Tune les hyperparamètres via Optuna
-    - Évalue la performance out-of-sample
+    - Validation croisée temporelle (TimeSeriesSplit)
+    - Tuning d'hyperparamètres via Optuna
+    - Évaluation out-of-sample
+
+    Paramètres
+    ----------
+    model : objet sklearn-like
+        Modèle de base (XGBRegressor, Ridge, etc.)
+    validation_data : pd.DataFrame
+        Dataset supervisé : features + colonne de target.
+    target_col : str
+        Nom de la colonne cible dans validation_data.
+    n_splits : int
+        Nombre de splits TimeSeriesSplit pour la CV.
+    base_params : dict, optionnel
+        Paramètres de base **fixes** du modèle (objective, random_state, etc.)
+        qui seront combinés avec les paramètres proposés par Optuna.
+    model_name : str, optionnel
+        Juste pour le logging (xgboost, ridge, etc.).
     """
 
     def __init__(
@@ -76,11 +92,15 @@ class ModelTuningValidation:
         validation_data: pd.DataFrame,
         target_col: str,
         n_splits: int = 5,
+        base_params: Optional[Dict[str, Any]] = None,
+        model_name: Optional[str] = None,
     ):
         self.model = model
         self.data = validation_data
         self.target_col = target_col
         self.n_splits = n_splits
+        self.base_params: Dict[str, Any] = base_params or {}
+        self.model_name = model_name or model.__class__.__name__
 
         if target_col not in validation_data.columns:
             raise ValueError(f"Target column '{target_col}' not in provided dataset.")
@@ -90,7 +110,11 @@ class ModelTuningValidation:
     # --------------------------------------------------------
     def cross_val_score(self, params: Dict[str, Any]) -> float:
         """
-        Retourne MSE moyen sur toutes les splits.
+        Retourne MSE moyen sur toutes les splits de TimeSeriesSplit.
+
+        On combine :
+        - les paramètres fixes de base (self.base_params),
+        - les hyperparamètres proposés par Optuna (params).
         """
         X = self.data.drop(columns=[self.target_col]).values
         y = self.data[self.target_col].values
@@ -102,13 +126,21 @@ class ModelTuningValidation:
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
 
-            model = self.model.__class__(**params)
+            # On merge base_params + params (les params Optuna
+            # écrasent les valeurs de base s'il y a conflit).
+            all_params = {**self.base_params, **params}
+
+            model = self.model.__class__(**all_params)
             model.fit(X_train, y_train)
 
             preds = model.predict(X_val)
             mse_scores.append(mean_squared_error(y_val, preds))
 
-        return float(np.mean(mse_scores))
+        mean_mse = float(np.mean(mse_scores))
+        logger.info(
+            "CV MSE (model=%s): %.6f", self.model_name, mean_mse
+        )
+        return mean_mse
 
     # --------------------------------------------------------
     # Function: Hyperparameter tuning
@@ -130,8 +162,8 @@ class ModelTuningValidation:
         study = optuna.create_study(direction="minimize")
         study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
 
-        logger.info("Best trial: %.6f", study.best_value)
-        logger.info("Best hyperparameters: %s", study.best_params)
+        logger.info("Best trial (model=%s): %.6f", self.model_name, study.best_value)
+        logger.info("Best hyperparameters (model=%s): %s", self.model_name, study.best_params)
 
         return study.best_params
 
@@ -140,7 +172,8 @@ class ModelTuningValidation:
     # --------------------------------------------------------
     def validate_model(self, model=None) -> Dict[str, float]:
         """
-        Évalue les performances finales du modèle (déjà tuné) sur une validation complète.
+        Évalue les performances finales du modèle (déjà tuné) sur une
+        dernière séparation temporelle 80% / 20%.
         """
         if model is None:
             model = self.model
@@ -172,5 +205,5 @@ class ModelTuningValidation:
             "sign_accuracy": sign_acc,
         }
 
-        logger.info("Validation results: %s", results)
+        logger.info("Validation results (model=%s): %s", self.model_name, results)
         return results

@@ -1,6 +1,7 @@
 # tradingalgo.py
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from srcgpt.feature_engineering_mkt_dtw_gpt import build_mkt_dtw_features_superv
 from srcgpt.model_tuning_gpt import ModelTuningValidation
 from srcgpt.strategy_gpt import make_predictions_and_signals
 from srcgpt.backtest_gpt import backtest_signals
+from srcgpt.visual_eda_gpt import VisualEDA
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +29,12 @@ START_DATE = "2022-01-01"
 END_DATE = "2023-12-31"
 TARGET_TICKER = "GC=F"
 
+RUN_HEAVY_EDA = True  # <<< mets True si tu veux lancer les 20 graphes
+
+USE_LOCAL_CSV = True
+CSV_PATH = "data/prices_raw.csv"
+
+# ---------- DATASET BUILDING ----------
 
 # ---------- DATASET BUILDING ----------
 
@@ -34,6 +42,8 @@ def build_dataset(
     tickers=TICKERS,
     start_date: str = START_DATE,
     end_date: str = END_DATE,
+    use_local_csv: bool = True,
+    csv_path: str = CSV_PATH,
 ) -> dict[str, pd.DataFrame]:
     """
     Construit les datasets de base :
@@ -43,32 +53,66 @@ def build_dataset(
     - moving_avg,
     - prices_savgol (filtrés Savitzky-Golay),
     - anomalies (Markov, Prophet optionnel).
+
+    Si use_cached_csv=True, lit les données déjà téléchargées (CSV).
+    Sinon, télécharge via yfinance (DataLoader).
     """
-    loader_config = DataLoaderConfig(
-        tickers=tickers,
-        start_date=start_date,
-        end_date=end_date,
-        price_column="Adj Close",
-        resample_rule=None,
-    )
-    loader = DataLoader(loader_config)
 
-    raw_data_dict = loader.fetch_data()
-    merged_data = loader.merge_data(raw_data_dict)
+    # ---------- 1) Charger les prix bruts ----------
+    if use_local_csv:
+        # Lecture du CSV tel que tu l’as montré
+        df = pd.read_csv(csv_path)
 
-    loader.eda_missing(merged_data, show=False)
-    loader.missing_test(merged_data)
+        # La première colonne s'appelle "Price" et contient en fait la date
+        # + deux lignes parasites "Ticker" et "Date"
+        df = df.rename(columns={"Price": "Date"})
+        # On supprime les lignes parasites
+        df = df[df["Date"].notna()]
+        df = df[~df["Date"].isin(["Ticker", "Date"])]
 
-    imputed_data = loader.impute_data(merged_data)
+        # Conversion en datetime + index
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date")
 
+        # On garde seulement les tickers que tu utilises
+        merged_data = df[tickers].astype(float)
+
+        logger.info("Loaded prices from CSV %s, shape=%s", csv_path, merged_data.shape)
+
+        # imputation simple (comme le DataLoader)
+        imputed_data = merged_data.ffill().bfill()
+
+    else:
+        # --- Version "réaliste" avec yfinance / DataLoader ---
+        loader_config = DataLoaderConfig(
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            price_column="Adj Close",
+            resample_rule=None,
+        )
+        loader = DataLoader(loader_config)
+
+        raw_data_dict = loader.fetch_data()
+        merged_data = loader.merge_data(raw_data_dict)
+
+        loader.eda_missing(merged_data, show=False)
+        loader.missing_test(merged_data)
+
+        imputed_data = loader.impute_data(merged_data)
+
+    # ---------- 2) Préprocessing / features de base ----------
     preproc = Preprocessing(imputed_data)
     cleaned = preproc.clean_data()
     features = preproc.transform_data(window_ma=10, scale_returns=True)
 
     # Filtres Savitzky-Golay (prix filtrés)
     savgol_prices = preproc.apply_filter(filter_type="savgol", window=11, polyorder=3)
+    kalman_prices = preproc.apply_filter(filter_type="kalman")
+    butter_prices = preproc.apply_filter(filter_type="butterworth", cutoff=0.05, order=2)
+    ma_prices = preproc.apply_filter(filter_type="moving_average", window=10)
+    ta_prices = preproc.apply_filter(filter_type="ta_lib", timeperiod=14)
 
-    # Aplatir les colonnes si on a des tuples/MultiIndex
     def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df.columns = [
@@ -81,6 +125,10 @@ def build_dataset(
     returns = _flatten_cols(features["returns"])
     scaled_returns = _flatten_cols(features["scaled_returns"])
     savgol_prices = _flatten_cols(savgol_prices)
+    kalman_prices = _flatten_cols(kalman_prices)
+    butter_prices = _flatten_cols(butter_prices)
+    ma_prices = _flatten_cols(ma_prices)
+    ta_prices = _flatten_cols(ta_prices)
 
     anomalies = preproc.anomaly_detection(
         use_markov=True,
@@ -95,6 +143,10 @@ def build_dataset(
         "scaled_returns": scaled_returns,
         "moving_avg": features["moving_avg"],
         "prices_savgol": savgol_prices,
+        "prices_kalman": kalman_prices,
+        "prices_butter": butter_prices,
+        "prices_ma10": ma_prices,
+        "prices_talib": ta_prices,
         "anomalies": anomalies,
     }
 
@@ -125,27 +177,86 @@ def run_leadlag_analysis(returns: pd.DataFrame) -> pd.DataFrame:
     return results
 
 
+
+
+from srcgpt.visual_eda_gpt import VisualEDA, VisualEDAConfig
+
+
+
 # ---------- MAIN PIPELINE (XGBoost + filtres + DTW) ----------
 
 def main():
     logger.info("Starting trading research pipeline (XGBoost + filters + DTW)...")
 
     # 1) Dataset de base
-    data_dict = build_dataset()
+    data_dict = build_dataset(use_local_csv=USE_LOCAL_CSV)
+
     prices = data_dict["prices"]
     returns = data_dict["returns"]          # log-returns
     scaled_returns = data_dict["scaled_returns"]
     prices_savgol = data_dict["prices_savgol"]
+    prices_kalman = data_dict["prices_kalman"]
+    prices_butter = data_dict["prices_butter"]
+    prices_talib = data_dict["prices_talib"]
+    anomalies = data_dict["anomalies"]
 
-    # 2) EDA (optionnel, tu peux commenter si ça spam trop de plots)
-    run_eda_on_returns(scaled_returns)
+    filtered_dict = {
+    "savgol": prices_savgol,
+    "kalman": prices_kalman,
+    "butterworth": prices_butter,
+    "talib_sma": prices_talib,
+    }
 
-    # 3) Lead-Lag DTW
+    # Volatilité glissante interactive multi-window
+    VisualEDA(prices=prices, returns=returns).plot_rolling_volatility_interactive(
+    asset="GC=F",
+    windows=(10, 20, 60, 120, 252),
+    annualize=True,
+    renderer="browser",  # évite ton erreur nbformat
+    )
+
+
+    VisualEDA(prices=prices, returns=returns).plot_filters_comparison_interactive(
+    asset="GC=F",
+    filtered_prices=filtered_dict,
+    normalize=True,
+    renderer="browser",  # safe pour ton Jupyter
+    )  
+    # 2) EDA (light)
+
+    run_eda = EDA(scaled_returns)
+    run_eda.correlation_matrix(max_lag=5, show_plot=True)
+    run_eda.dtw_clustermap(show_plot=True)
+
+    # 3) (optionnel) EDA visuelle avancée
+    if RUN_HEAVY_EDA:
+        veda = VisualEDA(prices=prices, returns=returns)
+
+        veda.plot_rolling_correlation_heatmap(window=60, step=5)
+        veda.plot_rolling_volatility_heatmap(window=60)
+        veda.plot_returns_zscore_heatmap(window=60)
+        veda.plot_correlation_clustermap()
+        veda.plot_distance_clustermap()
+        veda.plot_dtw_alignment("GC=F", "SI=F")
+        veda.plot_rolling_dtw_distance_heatmap(window=90, step=10)
+        veda.plot_macro_overlay_prices(["GC=F", "SI=F", "^TNX"], normalize=True)
+        veda.plot_macro_overlay_returns(["GC=F", "SI=F"])
+        veda.plot_overlay_spread("GC=F", "SI=F")
+        veda.plot_returns_distribution("GC=F")
+        veda.plot_distribution_evolution("GC=F", window=90)
+        veda.plot_smoothed_returns(method="ewma", span=10)
+        veda.plot_cumulated_returns()
+
+    VisualEDA(prices=prices_savgol, returns=returns).plot_cumulated_returns()
+    VisualEDA(prices=prices_kalman, returns=returns).plot_cumulated_returns()
+
+
+    # 4) Lead-Lag DTW
     lead_lag_results = run_leadlag_analysis(scaled_returns)
     print("\n=== Lead-Lag relationships (top 10) ===")
     print(lead_lag_results.head(10))
 
-    # 4) Features supervisées marché + filtres + DTW
+    # 5) Features supervisées marché + filtres + DTW
     supervised = build_mkt_dtw_features_supervised(
         prices=prices,
         returns=returns,

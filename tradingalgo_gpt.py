@@ -284,6 +284,14 @@ def main():
         trading_cost_bps=5.0,
     )
 
+    print("\n=== Backtest stats ===")
+    for k, v in stats.items():
+        print(f"{k}: {v:.4f}")
+    
+    # Optionnel (dans un notebook) pour voir la courbe de PnL :
+    # equity_curve["equity"].plot(figsize=(10, 4), title="Strategy Equity Curve")
+
+    logger.info("Pipeline finished.")
 
 if __name__ == "__main__":
     main()

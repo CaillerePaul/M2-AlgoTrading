@@ -73,7 +73,7 @@ def extract_leaders_and_lags(
 def build_mkt_dtw_features_supervised(
     prices: pd.DataFrame,
     returns: pd.DataFrame,
-    prices_savgol: pd.DataFrame,
+    prices_smooth: pd.DataFrame,
     dtw_results: pd.DataFrame,
     target_col: str,
     horizons: List[int] | None = None,
@@ -107,10 +107,10 @@ def build_mkt_dtw_features_supervised(
         raise ValueError(f"Target column '{target_col}' not in returns.")
 
     # Alignement des index
-    idx = prices.index.intersection(returns.index).intersection(prices_savgol.index)
+    idx = prices.index.intersection(returns.index).intersection(prices_smooth.index)
     px = prices.loc[idx].copy()
     ret = returns.loc[idx].copy()
-    px_filt = prices_savgol.loc[idx].copy()
+    px_filt = prices_smooth.loc[idx].copy()
 
     # DataFrame des features
     df = pd.DataFrame(index=idx)
